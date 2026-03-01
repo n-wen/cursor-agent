@@ -81,6 +81,24 @@ Skills directory: C:\Users\Administrator\.claude\skills
 <location>global</location>
 </skill>
 
+<skill>
+<name>simple-skill</name>
+<description>A simple skill example for testing the marketplace plugin system.</description>
+<path>/Users/xibaobao/.claude/skills/simple-skill/SKILL.md</path>
+<location>global</location>
+</skill>
+
 <!-- SKILLS_TABLE_END -->
 
 </skills_system>
+
+<!-- OPENSPEC:START -->
+## OpenSpec
+
+This project uses [OpenSpec](openspec/) for specification-driven development.
+
+- Read `openspec/AGENTS.md` for the full workflow guide
+- Read `openspec/project.md` for project context
+- Active changes live in `openspec/changes/`
+- Specifications live in `openspec/specs/`
+<!-- OPENSPEC:END -->

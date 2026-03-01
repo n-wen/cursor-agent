@@ -1,7 +1,7 @@
 import type { CursorStreamEvent, ToolCallEvent } from "./types.js";
 
 /**
- * 从 stream-json 行解析事件，每行是一个独立的 JSON 对象
+ * Parse an event from a stream-json line. Each line is an independent JSON object.
  */
 export function parseStreamLine(line: string): CursorStreamEvent | null {
   const trimmed = line.trim();
@@ -13,7 +13,7 @@ export function parseStreamLine(line: string): CursorStreamEvent | null {
   }
 }
 
-/** 从 tool_call started 事件中提取工具名称 */
+/** Extract tool name from a tool_call event */
 export function extractToolName(event: ToolCallEvent): string {
   const tc = event.tool_call;
   if (!tc) return "unknown";
@@ -26,7 +26,7 @@ export function extractToolName(event: ToolCallEvent): string {
   return keys[0] ?? "unknown";
 }
 
-/** 从 tool_call started 事件中提取工具参数摘要 */
+/** Extract tool argument summary from a tool_call started event */
 export function extractToolArgs(event: ToolCallEvent): string {
   const tc = event.tool_call;
   if (!tc) return "";
@@ -44,4 +44,31 @@ export function extractToolArgs(event: ToolCallEvent): string {
     }
   }
   return "";
+}
+
+/** Extract result text from a tool_call completed event */
+export function extractToolResult(event: ToolCallEvent): string {
+  const tc = event.tool_call;
+  if (!tc) return "";
+  for (const value of Object.values(tc)) {
+    const v = value as Record<string, unknown>;
+    // The result field may appear at different locations in completed events
+    if (typeof v?.result === "string") return truncate(v.result, 2000);
+    if (v?.output && typeof v.output === "string") return truncate(v.output, 2000);
+    if (v?.content) {
+      const content = v.content;
+      if (Array.isArray(content)) {
+        const texts = content
+          .filter((c: Record<string, unknown>) => c.type === "text" && c.text)
+          .map((c: Record<string, unknown>) => String(c.text));
+        if (texts.length > 0) return truncate(texts.join("\n"), 2000);
+      }
+    }
+  }
+  return "";
+}
+
+function truncate(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return s.slice(0, max) + `\n... (truncated, ${s.length - max} chars omitted)`;
 }

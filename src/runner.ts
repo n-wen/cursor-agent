@@ -1,6 +1,8 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
-import { parseStreamLine } from "./parser.js";
+import { parseStreamLine, extractToolName, extractToolArgs, extractToolResult } from "./parser.js";
+import * as registry from "./process-registry.js";
 import type {
   RunOptions,
   RunResult,
@@ -8,29 +10,25 @@ import type {
   ResultEvent,
   ToolCallEvent,
   SystemInitEvent,
+  CollectedEvent,
 } from "./types.js";
 
-/** 强制终止进程树 */
-function killProcess(proc: ChildProcess): void {
-  if (!proc.pid) return;
-  try {
-    if (process.platform === "win32") {
-      spawn("taskkill", ["/F", "/T", "/PID", String(proc.pid)], { stdio: "ignore" });
-    } else {
-      process.kill(-proc.pid, "SIGKILL");
-    }
-  } catch {
-    try { proc.kill("SIGKILL"); } catch { /* 忽略 */ }
-  }
-}
-
-/** 构建 PowerShell 命令（Windows）或 bash 命令（Linux/macOS） */
+/** Build CLI command and arguments */
 function buildCommand(opts: RunOptions): { cmd: string; args: string[] } {
   const agentArgs: string[] = [
     "-p", "--trust",
     "--output-format", "stream-json",
-    "--mode", opts.mode,
   ];
+
+  // Session management args are mutually exclusive with --mode: skip mode when resuming
+  if (opts.resumeSessionId) {
+    agentArgs.push("--resume", opts.resumeSessionId);
+  } else if (opts.continueSession) {
+    agentArgs.push("--continue");
+  } else if (opts.mode !== "agent") {
+    // agent is the default mode, no need to pass --mode; CLI only accepts plan and ask
+    agentArgs.push("--mode", opts.mode);
+  }
 
   if (opts.enableMcp) {
     agentArgs.push("--approve-mcps");
@@ -42,68 +40,91 @@ function buildCommand(opts: RunOptions): { cmd: string; args: string[] } {
   agentArgs.push(opts.prompt);
 
   if (process.platform === "win32") {
-    // Windows: 通过 PowerShell 调用 agent.cmd
     const escaped = opts.prompt.replace(/'/g, "''");
-    const agentLine = [
+    const parts = [
       "agent", "-p", "--trust",
       "--output-format", "stream-json",
-      "--mode", opts.mode,
-      ...(opts.enableMcp ? ["--approve-mcps"] : []),
-      ...(opts.model ? ["--model", `'${opts.model}'`] : []),
-      `'${escaped}'`,
-    ].join(" ");
+    ];
+    if (opts.resumeSessionId) {
+      parts.push("--resume", `'${opts.resumeSessionId}'`);
+    } else if (opts.continueSession) {
+      parts.push("--continue");
+    } else if (opts.mode !== "agent") {
+      parts.push("--mode", opts.mode);
+    }
+    if (opts.enableMcp) parts.push("--approve-mcps");
+    if (opts.model) parts.push("--model", `'${opts.model}'`);
+    parts.push(`'${escaped}'`);
 
-    const psCommand = `Set-Location '${opts.projectPath}'; ${agentLine}`;
+    const psCommand = `Set-Location '${opts.projectPath}'; ${parts.join(" ")}`;
     return { cmd: "powershell.exe", args: ["-NoProfile", "-Command", psCommand] };
   }
 
-  // Linux/macOS: 直接调用 agent
   return { cmd: opts.agentPath, args: agentArgs };
 }
 
-/** 执行 Cursor Agent CLI，返回分析结果 */
+/** Execute Cursor Agent CLI and collect the full event stream */
 export async function runCursorAgent(opts: RunOptions): Promise<RunResult> {
+  if (registry.isFull()) {
+    return {
+      success: false,
+      resultText: `Concurrency limit reached (${registry.getActiveCount()}), please try again later`,
+      durationMs: 0,
+      toolCallCount: 0,
+      error: "max concurrency reached",
+      events: [],
+    };
+  }
+
+  const runId = opts.runId ?? randomUUID();
   const startTime = Date.now();
   const { cmd, args } = buildCommand(opts);
 
+  const isUnix = process.platform !== "win32";
   const proc = spawn(cmd, args, {
-    cwd: process.platform === "win32" ? undefined : opts.projectPath,
+    cwd: isUnix ? opts.projectPath : undefined,
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
+    detached: isUnix,
   });
+  if (isUnix) proc.unref();
+
+  registry.register(runId, { proc, projectPath: opts.projectPath, startTime });
 
   let sessionId: string | undefined;
   let resultText = "";
-  const assistantTexts: string[] = [];
   let toolCallCount = 0;
   let completed = false;
   let error: string | undefined;
   let usage: ResultEvent["usage"];
   let lastOutputTime = Date.now();
+  const events: CollectedEvent[] = [];
 
-  // 总超时
+  const terminateProcess = () => {
+    if (proc.exitCode !== null || proc.killed) return;
+    registry.killWithGrace(proc);
+  };
+
   const totalTimeout = setTimeout(() => {
     if (!completed) {
       error = `total timeout (${opts.timeoutSec}s)`;
-      killProcess(proc);
+      terminateProcess();
     }
   }, opts.timeoutSec * 1000);
 
-  // 无输出超时检查（每 5 秒检查一次）
   const noOutputCheck = setInterval(() => {
     if (Date.now() - lastOutputTime > opts.noOutputTimeoutSec * 1000) {
       if (!completed) {
         error = `no output timeout (${opts.noOutputTimeoutSec}s)`;
-        killProcess(proc);
+        terminateProcess();
       }
     }
   }, 5000);
 
-  // 外部取消信号
   const onAbort = () => {
     if (!completed) {
       error = "aborted";
-      killProcess(proc);
+      terminateProcess();
     }
   };
   opts.signal?.addEventListener("abort", onAbort, { once: true });
@@ -123,10 +144,21 @@ export async function runCursorAgent(opts: RunOptions): Promise<RunResult> {
           }
           break;
 
+        case "user": {
+          const ue = event as { message?: { content?: Array<{ text?: string }> } };
+          const text = ue.message?.content?.[0]?.text;
+          if (text) {
+            events.push({ type: "user", text, timestamp: event.timestamp_ms });
+          }
+          break;
+        }
+
         case "assistant": {
           const ae = event as AssistantEvent;
           const text = ae.message?.content?.[0]?.text;
-          if (text) assistantTexts.push(text);
+          if (text) {
+            events.push({ type: "assistant", text, timestamp: event.timestamp_ms });
+          }
           break;
         }
 
@@ -134,39 +166,63 @@ export async function runCursorAgent(opts: RunOptions): Promise<RunResult> {
           const tc = event as ToolCallEvent;
           if (tc.subtype === "started") {
             toolCallCount++;
+            events.push({
+              type: "tool_start",
+              toolName: extractToolName(tc),
+              toolArgs: extractToolArgs(tc),
+              timestamp: event.timestamp_ms,
+            });
+          } else if (tc.subtype === "completed") {
+            events.push({
+              type: "tool_end",
+              toolName: extractToolName(tc),
+              toolResult: extractToolResult(tc),
+              timestamp: event.timestamp_ms,
+            });
           }
           break;
         }
 
         case "result": {
           const re = event as ResultEvent;
-          resultText = re.result ?? assistantTexts.join("\n");
+          resultText = re.result ?? "";
           usage = re.usage;
           completed = true;
+          events.push({
+            type: "result",
+            resultData: re,
+            timestamp: event.timestamp_ms,
+          });
           break;
         }
       }
     });
 
+    let cleaned = false;
     const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+
       clearTimeout(totalTimeout);
       clearInterval(noOutputCheck);
       opts.signal?.removeEventListener("abort", onAbort);
+      registry.unregister(runId);
 
-      // 完成后延迟 kill（应对进程不退出的已知 bug）
-      setTimeout(() => killProcess(proc), 3000);
+      if (proc.exitCode === null && !proc.killed) {
+        registry.killWithGrace(proc);
+      }
 
       const durationMs = Date.now() - startTime;
-      const finalText = resultText || assistantTexts.join("\n");
 
       resolve({
         success: !error && completed,
-        resultText: finalText || (error ? `Cursor Agent 执行失败: ${error}` : "未获取到分析结果"),
+        resultText: resultText || (error ? `Cursor Agent execution failed: ${error}` : "No analysis result obtained"),
         sessionId,
         durationMs,
         toolCallCount,
         error,
         usage,
+        events,
       });
     };
 
